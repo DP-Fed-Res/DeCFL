@@ -1,169 +1,115 @@
-import copy
 import os
-from options import args_parser
-from dataset import split_dataset
-from train import cmp_experiment, abl_experiment, noise_experiment, sampling_experiment
-import shutil
-from warnings import simplefilter
-import time
-from utils import set_random, create_keras_model
-import pandas as pd
+import copy
 import torch
-import multiprocessing as mp
+import argparse
+
+from warnings import simplefilter
+
+from dataset import get_dataloader
+from utils import set_random, create_keras_model
+from exp import decfl_exp, fedavg_exp, fedprox_exp, scaffold_exp, fed_pcdp_exp, flexcfl_exp, fesem_exp, fedrc_exp
 
 
-def get_train_config(data):
-    config = {
-        'Mnist': {
-            'lr_mode': 'SGD',
-            'local_steps': 20,
-            'batch_ratio': 0.02,
-            'lr': 0.1,  # 学习率
-            'lr_decay': 0.998,  # 学习率衰减系数(per step)
-            'noise': 1.0,  # DPSGD 噪声尺度
-            'noise_decay': 1.0,  # DPSGD 噪声衰减系数(per step)
-            'clip': 1.0,  # DPSGD 裁剪阈值
-        },
-        'FashionMnist': {
-            'lr_mode': 'SGD',
-            'local_steps': 20,
-            'batch_ratio':0.02,
-            'lr': 0.1,  # 学习率
-            'lr_decay': 0.998,  # 学习率衰减系数(per step)
-            'noise': 1.0,  # DPSGD 噪声尺度
-            'noise_decay': 1.0,  # DPSGD 噪声衰减系数(per step)
-            'clip': 1.0,  # DPSGD 裁剪阈值
-        },
-        'Cifar10': {
-            'lr_mode': 'SGD',
-            'local_steps': 20,
-            'batch_ratio':0.02, # 设为-1时，batch_size为64
-            'lr': 0.1,  # 学习率
-            'lr_decay': 0.998,  # 学习率衰减系数(per step)
-            'noise': 1.0,  # DPSGD 噪声尺度
-            'noise_decay': 1.0,  # DPSGD 噪声衰减系数(per step)
-            'clip': 1.0,  # DPSGD 裁剪阈值
-        }
-    }
-    return config.get(data, None)
+def parse_args(args_string=None):
+    """封装参数解析器，支持传入字符串或使用系统参数"""
+    parser = argparse.ArgumentParser()
 
+    parser.add_argument('--alg', type=str, default='fedavg', help='指定联邦学习算法')
+    parser.add_argument('--gpu', type=int, default=0, help="GPU ID")
+    parser.add_argument('--seed', type=int, default=123, help="随机数种子")
 
-def get_fl_config(dataset, Scenario):
-    """
-        先划分p(y|x)异构，再划分p(y)异构
-        groups1=1，groups2=1，无p(y|x)异构，无p(y)异构；
-        groups1=2，groups2=1，有两种p(y|x)异构，无p(y)异构；
-        groups1=1，groups2=2，无p(y|x)异构，有两种p(y)异构；
-        groups1=2，groups2=2，有两种p(y|x)异构，p(y|x)一致时仍有两种p(y)异构；
-    """
+    # 数据集参数
+    parser.add_argument('--dataset', type=str, default='Mnist', help="数据集类型")
+    parser.add_argument('--g1', type=int, default=2, help="组数量，每组p(y|x)不同")
+    parser.add_argument('--g2', type=int, default=10, help="组数量，每组p(y)不同")
+    parser.add_argument('--per_group', type=int, default=1, help="每组中客户端数量")
+    parser.add_argument('--split', type=str, default='dirichlet', help="客户端数据分布")
+    parser.add_argument('--same_py', type=int, default=1, help="不同概念分布组的标签分布是否一致")
+    parser.add_argument('--alpha', type=float, default=1.0, help="dirichlet paras")
+    parser.add_argument('--n_class', type=int, default=10, help="total classes")
 
-    args = args_parser()
-    args.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    args.dataset = dataset
-    # FL参数
-    if dataset == 'Cifar10':
-        args.rounds = 10  # FL轮数
-        args.k = 400  # 梯度降维,-1则不降维(受显存限制，可酌情减小)
+    # 客户端参数
+    parser.add_argument('--lr_mode', type=str, default='SGD', help="优化器类型")
+    parser.add_argument('--freeze_1st', type=int, default=0, help="首轮是否冻结特征层")
+    parser.add_argument('--tc_1st', type=int, default=150, help="首轮本地训练步数")
+    parser.add_argument('--tc', type=int, default=50, help="本地训练步数")
+    parser.add_argument('--br', type=float, default=0.02, help="批次比例")
+    parser.add_argument('--lr', type=float, default=0.1, help="学习率")
+
+    parser.add_argument('--eps', type=float, default=1.0, help="DP paras")
+    parser.add_argument('--clip', type=float, default=1.0, help="DP paras")
+    parser.add_argument('--delta', type=float, default=1e-5, help="DP paras")
+
+    # 联邦参数
+    parser.add_argument('--tg', type=int, default=20, help="FL rounds")
+    parser.add_argument('--sampling_rate', type=float, default=1.0, help="客户端采样率")
+
+    # decfl参数
+    parser.add_argument('--k', type=int, default=400, help="子空间降维参数")
+    parser.add_argument('--gc', type=int, default=1, help='GC机制开关: 1开启, 0关闭')
+    parser.add_argument('--ha', type=int, default=1, help='HA机制开关: 1开启, 0关闭')
+
+    if args_string:
+        return parser.parse_args(args_string.split())
     else:
-        args.rounds = 10
-        args.k = 400  # 梯度降维,-1则不降维
-    # 客户端数据异构参数
-    args.Scenario = Scenario
-    if args.Scenario == 1:  # py|x + py异构
-        args.groups1 = 5  # 组数量，每组p(y|x)不同，假设已知
-        args.groups2 = 5  # 组数量，每组p(y)不同
-        args.clients_per_group = 1  # p(y|x)和p(y)均一致的客户端数量
-        args.K = args.groups1
-        args.n_clients = args.groups1 * args.groups2 * args.clients_per_group  # 总客户端数=groups1*groups2*clients_per_group
-        args.alpha = 1.0  # p(y) dirichlet paras
-        args.overlap_ratio = False  # p(y|x) dirichlet paras
-        args.same_py = True  # 不同p(y|x)组内的p(y)异构是否保持一致
-        args.prior_cls = [i // int(args.n_clients/args.K) for i in range(args.n_clients)]
-    elif args.Scenario == 2:  # py|x异构
-        args.groups1 = 5  # 组数量，每组p(y|x)不同，假设已知
-        args.groups2 = 1  # 组数量，每组p(y)不同
-        args.clients_per_group = 5  # p(y|x)和p(y)均一致的客户端数量
-        args.K = args.groups1
-        args.n_clients = args.groups1 * args.groups2 * args.clients_per_group  # 总客户端数=groups1*groups2*clients_per_group
-        args.alpha = 1.0  # p(y) dirichlet paras
-        args.overlap_ratio = False  # p(y|x) dirichlet paras
-        args.same_py = True  # 不同p(y|x)组内的p(y)异构是否保持一致
-        args.prior_cls = [i // int(args.n_clients/args.K) for i in range(args.n_clients)]
-    else:  # py异构
-        args.groups1 = 1  # 组数量，每组p(y|x)不同，假设已知
-        args.groups2 = 5  # 组数量，每组p(y)不同
-        args.clients_per_group = 5  # p(y|x)和p(y)均一致的客户端数量
-        args.K = args.groups1
-        args.n_clients = args.groups1 * args.groups2 * args.clients_per_group  # 总客户端数=groups1*groups2*clients_per_group
-        args.alpha =1.0  # p(y) dirichlet paras
-        args.overlap_ratio = False  # p(y|x) dirichlet paras
-        args.same_py = True  # 不同p(y|x)组内的p(y)异构是否保持一致
-        args.prior_cls = [i // int(args.n_clients/args.K) for i in range(args.n_clients)]
+        return parser.parse_args()
 
 
-    print(args.prior_cls)
-    args.primary_aggregation = True
+def main(params):
+    l_train_loader, g_test_loader = get_dataloader(params.dataset, params.g1, params.g2, params.per_group, params.alpha, params.same_py, params.br, params.device)
 
-    # 客户端训练相关
-    args.train_config = get_train_config(args.dataset)
-    # 保存路径
-    args.ckpt_dir = ('./ckpt/group/client' + str(args.n_clients) +
-                     '_g1' + '(' + str(args.groups1) + ')' +
-                     '_g2' + '(' + str(args.groups2) + ')' +
-                     '_split' + '(' + args.split + str(args.alpha) + ')' +
-                     '_noise' + '(' + str(args.train_config.get('noise')) + ')' +
-                     args.dataset)
-    if not os.path.exists(args.ckpt_dir):
-        os.makedirs(args.ckpt_dir)
-    else:
-        shutil.rmtree(args.ckpt_dir)
-        os.makedirs(args.ckpt_dir)
-
-    return args
-
-
-def main():
-    # 构造数据
-    train, val, test, label_maps, report, (all_client_data, all_client_labels, transform) = split_dataset(dataset_name=args.dataset,
-                                                         num_concept_groups=args.groups1,
-                                                         num_label_groups=args.groups2,
-                                                         num_clients_per_group=args.clients_per_group,
-                                                         alpha=args.alpha,
-                                                         overlap_ratio=args.overlap_ratio,
-                                                         same_py=args.same_py,
-                                                         batch_ratio=args.train_config.get('batch_ratio'))
-    # 将 per-client 原始数组打包传给子进程，避免直接 pickle DataLoader/FedRCClient
-    client_arrays_pack = {
-        'client_arrays': [(all_client_data[i], all_client_labels[i]) for i in range(len(all_client_data))],
-    }
-    print(label_maps)
-    print('dataset: ', args.dataset)
-
-    # 构造全局模型
-    global_model = create_keras_model(args.dataset).to(device=args.device)
+    global_model = create_keras_model(params.dataset).to(device=params.device)
     total_params = sum(p.numel() for p in global_model.parameters())
-    args.params_num = total_params
+    params.params_num = total_params
     print('Total params: {}'.format(total_params))
 
-    args.sampling_rate = 1.0
-    for noise in [0, 1.0, 1.5, 2.0]:  # 0, 1.0, 1.5, 2.0
-        args.train_config['noise'] = noise
-        # 消融实验
-        abl_experiment(train, val, test, copy.deepcopy(global_model), args)
-        # 对比实验
-        # cmp_experiment(train, val, test, copy.deepcopy(global_model), args, client_arrays_pack)
+    if args.alg in ['decfl', 'decfl-wo-ha', 'decfl-wo-gc']:
+        res = decfl_exp(copy.deepcopy(global_model), l_train_loader, g_test_loader, params)
+    elif args.alg == 'fedavg':
+        res = fedavg_exp(copy.deepcopy(global_model), l_train_loader, g_test_loader, params)
+    elif args.alg == 'fedprox':
+        res = fedprox_exp(copy.deepcopy(global_model), l_train_loader, g_test_loader, params)
+    elif args.alg == 'scaffold':
+        res = scaffold_exp(copy.deepcopy(global_model), l_train_loader, g_test_loader, params)
+    elif args.alg == 'flexcfl':
+        res = flexcfl_exp(copy.deepcopy(global_model), l_train_loader, g_test_loader, params)
+    elif args.alg == 'fesem':
+        res = fesem_exp(copy.deepcopy(global_model), l_train_loader, g_test_loader, params)
+    elif args.alg == 'fed_pcdp':
+        res = fed_pcdp_exp(copy.deepcopy(global_model), l_train_loader, g_test_loader, params)
+    elif args.alg == 'fedrc':
+        res = fedrc_exp(copy.deepcopy(global_model), l_train_loader, g_test_loader, params)
+    else:
+        raise Exception
 
     print('finish')
+    return res
 
 
 if __name__ == '__main__':
-    os.environ["WANDB_API_KEY"] = 'e5dc3f1f4d367ec3a412d359ae4cfc222deacfa2'
-    # os.environ["WANDB_MODE"] = "offline"
     simplefilter(action="ignore", category=FutureWarning)
     simplefilter(action="ignore", category=UserWarning)
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(0)
-    Scenario = 1 # 1混合异构；2单一异构
-    for dataset in ['Cifar10', 'FashionMnist', 'Mnist']:  # 'Cifar10', 'FashionMnist', 'Mnist'
-        args = get_fl_config(dataset, Scenario)
-        set_random(args.seed)
-        main()
+
+    IS_DEBUG = True  # 设置为 True: 在IDE直接跑预设参数 | 设置为 False: 真实命令行模式
+
+    if IS_DEBUG:
+        # 在这里写想要 Debug 的参数
+        debug_command = ("--alg decfl --dataset Cifar10 --g1 4 --g2 5 --alpha 1.0 "
+                         "--tc_1st 150 --tc 50 --br 0.02 --lr 0.1 "
+                         "--tg 20 --eps 5 --clip 15.0 --gpu 0 --freeze_1st 1")
+        args = parse_args(debug_command)
+    else:
+        # 真实命令行模式
+        args = parse_args()
+
+    args.n_clients = args.g1 * args.g2 * args.per_group
+    args.prior_cls = [i // int(args.n_clients / args.g1) for i in range(args.n_clients)]
+
+    # 设置 GPU 环境
+    gpu = getattr(args, 'gpu', 0)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    args.device = torch.device(f'cuda:{gpu}' if torch.cuda.is_available() else 'cpu')
+
+    print("最终运行参数:", args)
+    set_random(args.seed)
+    main(args)

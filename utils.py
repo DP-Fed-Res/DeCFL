@@ -1,3 +1,5 @@
+import gc
+import os
 import abc
 import random
 import torch
@@ -5,49 +7,37 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import torch.nn as nn
+import torch.optim as optim
 
 from typing import List
 from numpy.random import default_rng
-from model import MnistCnn, FashionMnistCnn, CifarResNet, Cifar10Cnn
-from account import MomentsAccountant
 from torch.utils.data import DataLoader
-
 from sklearn.manifold import TSNE
-from cluster import compute_pairwise_dis
-
-import os
-from sklearn.metrics import normalized_mutual_info_score
-
+from sklearn.metrics import adjusted_rand_score
 from collections import Counter
 
+from model import MnistCnn, FashionMnistCnn, CifarResNet, DistilBertClassifier, RobertaClassifier
+from cluster import compute_pairwise_dis
 
-def nmi_cal(cluster, pre_cls):
-    # mask = np.zeros([args.n_clients, args.groups1])
-    # for i in range(args.groups1):
-    #     for j in cluster[i]:
-    #         mask[j][i] = 1
-    #
-    # u = best_u * mask
-    # u = u / np.sum(u, axis=1, keepdims=True)
-    # pyx_nmi = fuzzy_normalized_mutual_info(u, args.prior_cls)
 
-    n = len(pre_cls)
-    m = len(Counter(pre_cls))
+def cluster_eval(cluster, proir_cls):
+    n = len(proir_cls)
+    m = len(Counter(proir_cls))
     u = np.zeros(n)
     for i in range(n):
         for j in range(m):
             if i in cluster[j]:
                 u[i] = j
-    pyx_nmi = normalized_mutual_info_score(pre_cls, u)
+    pyx_ari = adjusted_rand_score(proir_cls, u)
 
-    return pyx_nmi
+    return pyx_ari
 
 
-def evaluate_cluster_models(models, test_loader):
+def evaluate_cluster_models(models, test_loader, device):
     """评估所有聚类模型，返回最佳测试准确率和对应类别准确率"""
     test_acc, class_accuracy = 0, 0
     for model in models.values():
-        t_acc, t_class_acc = label_test(model, test_loader)
+        t_acc, t_class_acc = label_test(model, test_loader, device)
         if t_acc > test_acc:
             test_acc, class_accuracy = t_acc, t_class_acc
     return test_acc, class_accuracy
@@ -61,20 +51,17 @@ def evaluate_clients(clients, cluster_models, client_groups):
     ]
 
 
-def fed_eval(server, clients):
+def fed_eval(server, device):
     test_loader = server.test_loader
     # 测试集评估
     test_acc = []
     for i, loader in enumerate(test_loader):
-        t_acc, class_accuracy = evaluate_cluster_models(server.cluster_models, loader)
+        t_acc, class_accuracy = evaluate_cluster_models(server.cluster_models, loader, device)
         # draw_bar(num_classes=10, data=class_accuracy, name=f'{alg}_cluster{i}_acc')
         test_acc.append(t_acc)
         # print(f'{alg}_test_acc_{i}: {np.max(t_acc)}')
 
-    # 验证集评估
-    # val_acc = evaluate_clients(clients, server.cluster_models, server.client_groups)
-    # print(f'{alg}_val_acc: {np.mean(val_acc)}')
-    return 0, np.mean(test_acc)
+    return np.mean(test_acc)
 
 
 def client_grad_tnse(dws):
@@ -147,7 +134,7 @@ def draw_bar(num_classes, data, name):
     plt.savefig("./imgs/" + name + ".png")
 
 
-def label_test(model, test_loader):
+def label_test(model, test_loader, device):
     num_classes = 10
     class_correct = [0] * num_classes
     class_total = [0] * num_classes
@@ -155,7 +142,7 @@ def label_test(model, test_loader):
     criterion = nn.CrossEntropyLoss(reduction='none')
     with torch.no_grad():
         for images, labels in test_loader:
-            images, labels = images.cuda(), labels.long().cuda()
+            labels = labels.long().to(device)
             outputs = model(images)
             losses = criterion(outputs, labels)
             _, predicted = torch.max(outputs, 1)
@@ -167,6 +154,7 @@ def label_test(model, test_loader):
                 if pred_i == label_i:
                     class_correct[label_i] += 1
                 class_total[label_i] += 1
+
     # 计算并打印各类准确率和损失
     class_accuracy = []
     class_avg_loss = []
@@ -181,12 +169,6 @@ def label_test(model, test_loader):
         class_avg_loss.append(avg_loss)
 
     return np.sum(class_correct)/np.sum(class_total), class_accuracy
-
-
-def softmax(x):
-    # 为了数值稳定性，减去最大值
-    e_x = np.exp(x - np.max(x))
-    return e_x / e_x.sum(axis=0)
 
 
 def min_max_normalize(arr, target_min=0, target_max=1):
@@ -223,46 +205,103 @@ def visualize_forward_propagation(activations):
     plt.show()
 
 
-def get_eps(clients, smaple_account, args):
-    if np.min(args.train_config.get('noise')) > 0.1:
-        epsilon = []
-        for i in range(args.n_clients):
-            if smaple_account[i] > 0:
-                epsilon.append(clients[i].privacy_engine.get_epsilon(delta=args.delta))
-            else:
-                epsilon.append(0)
-    else:
-        epsilon = np.zeros(args.n_clients) + 1e3
+def get_eps(clients, smaple_account, delta):
+    n_clients = len(clients)
+    epsilon = []
+    for i in range(n_clients):
+        if smaple_account[i] > 0:
+            epsilon.append(clients[i].privacy_engine.get_epsilon(delta=delta))
+        else:
+            epsilon.append(0)
+
     return epsilon
 
 
-def get_Vk(args, dataset, model):
-    T = int(args.k * 1.5)
-    device = args.device
-    criterion = nn.CrossEntropyLoss().cuda()
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.001)
-    dataloader = DataLoader(dataset, batch_size=50, shuffle=True)
+def get_Vk(dataset, model, k_step, lr_mode, lr, device, freeze=0):
+    T = int(k_step * 1.5)
+
+    model = model.to(device)
+    model.train()
+
+    #
+    if freeze:
+        for param in model.parameters():
+            param.requires_grad = False
+
+        if hasattr(model, 'fc'):
+            for param in model.fc.parameters():
+                param.requires_grad = True
+        else:
+            raise AttributeError("Model does not have 'fc' attribute")
+
+    #
+    optimized_params = [p for p in model.parameters() if p.requires_grad]
+
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    if lr_mode == 'SGD':
+        optimizer = optim.SGD(optimized_params, lr=lr)
+    elif lr_mode == 'AdamW':
+        optimizer = optim.AdamW(optimized_params, lr=lr)
+    else:
+        raise NotImplementedError(f"Unsupported optimizer: {lr_mode}")
+
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+    # 确保损失函数也在正确的设备上
     step = 0
-    gradients = []
+    gradients_on_cpu = []
+
+    num_params = sum(p.numel() for p in optimized_params)
+    print(f"Collecting {T} gradients from a model with P parameters (approx. {num_params})...")
+
+    # 使用外层 while 处理 T 大于 dataloader 长度 (跨 Epoch) 的情况
     while step < T:
         for data, target in dataloader:
-            data = data.to(device)
+            # data已在loader中处理
             target = target.to(device)
+
             optimizer.zero_grad()
             output = model(data)
             loss = criterion(output, target.long())
             loss.backward()
-            optimizer.step()  # 优化器更新语句后模型梯度才会被更新
-            # 记录梯度
-            grad = torch.cat([p.grad.view(-1) for p in model.parameters() if p.grad is not None])
-            gradients.append(grad)
+
+            # 提取梯度并立即将其从 GPU 移动到 CPU
+            # 只提取 optimized_params 中的梯度，避免拼接 NoneType 引发异常
+            grads = [p.grad.view(-1) for p in optimized_params if p.grad is not None]
+            if grads:
+                grad_flat_cpu = torch.cat(grads).cpu()
+                gradients_on_cpu.append(grad_flat_cpu)
+
+            optimizer.step()  # 梯度记录后才更新模型参数
+
             step += 1
             if step >= T:
-                break
-    X = torch.stack(gradients)
-    _, S, V = torch.svd(X)  # 进行SVD分解
-    V_k = V[:, :args.k]
-    print('Dimensionality reduction ratio:', torch.sum(S[:args.k]**2) / torch.sum(S**2))
+                break  # 达到数量限制，跳出内层 for 循环
+
+    X = torch.stack(gradients_on_cpu, dim=0)
+
+    print(f"All gradients collected. Performing SVD on CPU for a matrix of size {X.shape} (T x P)...")
+
+    # 在 CPU 上执行 SVD (full_matrices=False 显著节省内存和计算)
+    U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+
+    # Vh 是 V-Hermitian (共轭转置)，我们需要 Vh.T 得到 V
+    V = Vh.T
+
+    # 防止 k_step 大于实际的列数导致越界报错
+    actual_k = min(k_step, V.shape[1])
+    V_k = V[:, :actual_k].to(device)
+
+    # 计算降维比率 (能量占比)
+    ratio = torch.sum(S[:actual_k] ** 2) / torch.sum(S ** 2)
+    print(f'Dimensionality reduction ratio: {ratio.item():.4f}')
+
+    del model, X, U, S, Vh, V, gradients_on_cpu
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
     return V_k
 
 
@@ -318,14 +357,18 @@ def set_random(seed):
 
 def create_keras_model(dataset):
     if dataset == 'Cifar10':
-        # model = CifarResNet(in_channels=3, num_classes=10)  # VGG11(), ResNet9
-        model = Cifar10Cnn(in_channels=3, num_classes=10)
+        model = CifarResNet(in_channels=3, num_classes=10)
     elif dataset == 'FashionMnist':
         model = FashionMnistCnn(in_channels=1, num_classes=10)
     elif dataset == 'Mnist':
         model = MnistCnn(in_channels=1, num_classes=10)
+    elif dataset == 'text-roberta':
+        model = RobertaClassifier(num_classes=10)
+    elif dataset == 'text-distill':
+        model = DistilBertClassifier(num_classes=10)
     else:
         raise NotImplementedError
+
     for m in model.modules():
         if isinstance(m, nn.Conv2d):
             nn.init.kaiming_normal_(m.weight.data)
@@ -336,15 +379,6 @@ def create_keras_model(dataset):
             if m.bias is not None:
                 m.bias.data.fill_(0)
     return model
-
-
-def compute_epsilon(steps, sampling_probability, args):
-    """Computes epsilon value for given hyperparameters."""
-    delta = args.delta
-    accountant = MomentsAccountant()
-    epsilon = accountant.get_privacy_spent(args.noise_multiplier, sampling_probability, steps, args.delta)
-    print('delta: %f ,epsilon: %f' % (delta, epsilon))
-    return delta, epsilon
 
 
 def print_model_parameters(model):

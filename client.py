@@ -1,848 +1,455 @@
+import gc
+import copy
+import itertools
 import torch.optim as optim
+import torch.nn.functional as F
 from utils import *
 from customopacus import PrivacyEngine
 # from opacus import PrivacyEngine
 from tqdm import tqdm
 from scipy.spatial.distance import jensenshannon
-import time
-import copy
-from collections import defaultdict
+from torch.cuda.amp import autocast, GradScaler
+from typing import Dict, Any, Optional
 
 
-class DeCflClient(object):
-    def __init__(self, id_num, train_d, val_d, device, train_config):
+class BaseClient(object):
+    """
+    基础联邦学习客户端（基类）
+    """
+
+    def __init__(self, id_num, train_d, train_config):
         self.id = id_num  # 客户端编号
         self.train_loader = train_d
-        self.val_loader = val_d
         self.data_size = len(self.train_loader.dataset)
-        self.device = device
-        self.lr_mode = train_config.get('lr_mode')
-        self.batch_size = train_config.get('batch_size')
-        self.first_local_steps = 200
-        self.local_steps = train_config.get('local_steps')
-        self.lr = train_config.get('lr')
-        self.grad_clip = train_config.get('clip')
-        self.noise_multiplier = train_config.get('noise')
-        self.lr_decay = train_config.get('lr_decay')
-        self.noise_decay = train_config.get('noise_decay')
 
-        self.dW = None
-        self.model_params = None
-        self.criterion = nn.CrossEntropyLoss()
+        # 训练配置
+        self.device = train_config.get('device')
+        self.lr_mode = train_config.get('lr_mode')
+        self.freeze_feature = train_config.get('freeze_1st')
+        self.local_steps = train_config.get('tc')
+        self.first_local_steps = train_config.get('tc_1st')
+        self.lr = train_config.get('lr')
+        self.clip = train_config.get('clip')
+        self.noise_mul = train_config.get('noise')
+        self.momentum = 0.9
+
         self.privacy_engine = PrivacyEngine(accountant='prv')
-
-    def len(self):
-        return len(self.train_loader.dataset)
-
-    def evaluate(self, model):
-        device = self.device
-        criterion = self.criterion.to(device)
-        model.eval()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        val_loader = self.val_loader
-        with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels.long())
-
-                running_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-
-        val_loss = running_loss / len(val_loader)
-        val_acc = correct / total
-        return val_loss, val_acc
-
-    def train_py_aware(self, model, vk=None):
-        model.train()
-        vec_init = tensor_dict_to_vector(model.state_dict())
-        train_loader = self.train_loader
-        device = self.device
-        criterion = self.criterion.to(device)
-        noise_mul = self.noise_multiplier
-        clip = self.grad_clip
-        max_step = max(self.first_local_steps, self.local_steps)
-        lr = self.lr
-        if self.lr_mode == 'SGD':
-            optimizer = optim.SGD(model.parameters(), lr=lr)
-        elif self.lr_mode == 'Adam':
-            optimizer = optim.Adam(model.parameters(), lr=lr)
-        else:
-            raise NotImplementedError
-        if noise_mul > 0:
-            model, optimizer, train_loader = self.privacy_engine.make_private(
-                Vk=vk,
-                module=model,
-                optimizer=optimizer,
-                data_loader=train_loader,
-                noise_multiplier=noise_mul,
-                max_grad_norm=clip,
-                poisson_sampling=False,
-            )
-        # 客户端训练
-        step = 0
-        bias = []
-        bias_grad = []
-        res = []
-        loss = []
-        while step < max_step:
-            for data, target in train_loader:
-                # print(step, optimizer.state_dict()['param_groups'][0]['lr'])
-                data = data.to(device)
-                target = target.to(device)
-                optimizer.zero_grad()
-                output = model(data)
-                res.append(np.mean(torch.softmax(output, dim=-1).detach().cpu().numpy(), axis=0))
-                t_loss = criterion(output, target.long())
-                t_loss.backward()
-                loss.append(t_loss.item())
-                optimizer.step()  # 优化器更新语句后模型梯度才会被更新
-                if noise_mul > 0 and optimizer.noise_multiplier > 0.5:
-                    optimizer.noise_multiplier *= self.noise_decay
-                if optimizer.param_groups[0]['lr'] > 0.01:
-                    optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * self.lr_decay
-                # 参数记录
-                for k, v in model.named_parameters():
-                    if noise_mul > 0 and k == '_module.fc.bias':
-                        bias.append(v.detach().cpu().clone())
-                        bias_grad.append(v.grad.clone().detach().cpu().clone())
-                    if k == 'fc.bias':
-                        bias.append(v.detach().cpu().clone())
-                        bias_grad.append(v.grad.clone().detach().cpu().clone())
-                step += 1
-                if step >= max_step:
-                    break
-        # res = np.array(res)
-        # loss = np.array(loss)
-        # end_time = time.time()
-        # v_loss, v_acc = self.evaluate(model)
-        # print('Val acc:', v_acc)
-        # print(f'id{self.id} Step{max_step} [v_loss={v_loss}, v_acc={v_acc}, time={end_time-start_time}]')
-        # label_test(model, self.val_dataset, 'client' + str(self.id))
-        # 计算模型总变化量
-        local_models_params = tensor_dict_to_vector(model.state_dict())
-        self.dW = local_models_params - vec_init
-        self.model_params = model.state_dict()
-
-        # 分析分类偏置层历史梯度
-        # self.draw(bias_grad)
-        # window = 5
-        # M = []
-        # for ii in range(max_step - window):  # 滑动窗搜索
-        #     M.append(np.mean(bias_grad[ii:ii + window], axis=0))
-        # M = np.array(M)
-        # M = np.abs(M)
-        # T = np.sort(np.max(M, axis=1))[::-1][int(max_step * 0.2)]
-        # index = np.where(np.max(M, axis=1) < T)[0]
-        # if index.size > 0:
-        #     index = index[0]
-        # else:
-        #     raise ValueError('loss is too large, try increasing local_steps')
-
-        index = 5
-        data = torch.stack(bias_grad).numpy()
-        bias_grad_std = np.std(data[index: index + 30], axis=0)
-        pre_py = bias_grad_std / np.sum(bias_grad_std)
-
-        true_py = np.bincount(train_loader.dataset.dataset.labels, minlength=len(pre_py))
-        true_py = true_py / np.sum(true_py)
-
-        py_dis = jensenshannon(true_py, pre_py)
-        # print('JS(true,pre): ', py_dis)
-        # print(np.sort(bias_grad_std))
-        return pre_py, py_dis
-
-    def train(self, model, vk=None):
-        model.train()
-        vec_init = tensor_dict_to_vector(model.state_dict())
-        train_loader = self.train_loader
-        device = self.device
-        criterion = self.criterion.to(device)
-        noise_mul = self.noise_multiplier
-        clip = self.grad_clip
-        max_step = self.local_steps
-        lr = self.lr
-        if self.lr_mode == 'SGD':
-            optimizer = optim.SGD(model.parameters(), lr=lr)
-        elif self.lr_mode == 'Adam':
-            optimizer = optim.Adam(model.parameters(), lr=lr)
-        else:
-            raise NotImplementedError
-        if noise_mul > 0:
-            model, optimizer, train_loader = self.privacy_engine.make_private(
-                Vk=vk,
-                module=model,
-                optimizer=optimizer,
-                data_loader=train_loader,
-                noise_multiplier=noise_mul,
-                max_grad_norm=clip,
-                poisson_sampling=False,
-            )
-        step = 0
-        while step < max_step:
-            for data, target in train_loader:
-                data = data.to(device)
-                target = target.to(device)
-                optimizer.zero_grad()
-                output = model(data)
-                t_loss = criterion(output, target.long())
-                t_loss.backward()
-                optimizer.step()  # 优化器更新语句后模型梯度才会被更新
-                if noise_mul > 0 and optimizer.noise_multiplier > 0.5:
-                    optimizer.noise_multiplier *= self.noise_decay
-                if optimizer.param_groups[0]['lr'] > 0.01:
-                    optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * self.lr_decay
-                    self.lr = optimizer.param_groups[0]['lr']
-                step += 1
-                if step >= max_step:
-                    break
-        local_models_params = tensor_dict_to_vector(model.state_dict())
-        self.dW = local_models_params - vec_init
-        self.model_params = model.state_dict()
-
-
-class FedAvgClient(object):
-    def __init__(self, id_num, train_d, val_d, device, train_config):
-        self.id = id_num  # 客户端编号
-        self.train_loader = train_d
-        self.val_loader = val_d
-        self.data_size = len(self.train_loader.dataset)
-        self.device = device
-        self.lr_mode = train_config.get('lr_mode')
-        self.batch_size = train_config.get('batch_size')
-        self.local_steps = train_config.get('local_steps')
-        self.lr = train_config.get('lr')
-        self.lr_decay = train_config.get('lr_decay')
-
-        self.dW = None
-        self.model_params = None
         self.criterion = nn.CrossEntropyLoss()
 
-        self.grad_clip = train_config.get('clip')
-        self.noise_multiplier = train_config.get('noise')
-        self.privacy_engine = PrivacyEngine(accountant='prv')
+        self.model_params = None
+        self.params_dir = f'./saved_models/client_{id_num}'
+        os.makedirs(self.params_dir, exist_ok=True)
 
-    def len(self):
-        return len(self.train_loader.dataset)
+    def __len__(self):
+        return self.data_size
 
-    def evaluate(self, model):
-        device = self.device
-        criterion = self.criterion.to(device)
-        model.eval()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        val_loader = self.val_loader
-        with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels.long())
-
-                running_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-
-        val_loss = running_loss / len(val_loader)
-        val_acc = correct / total
-        return val_loss, val_acc
-
-    def train(self, model, Vk=None):
-        model.train()
-        vec_init = tensor_dict_to_vector(model.state_dict())
-        train_loader = self.train_loader
-        device = self.device
-        criterion = self.criterion.to(device)
-        noise_mul = self.noise_multiplier
-        clip = self.grad_clip
-        max_step = self.local_steps
-        lr = self.lr
+    def _create_optimizer(self, model: nn.Module) -> optim.Optimizer:
         if self.lr_mode == 'SGD':
-            optimizer = optim.SGD(model.parameters(), lr=lr)
-        elif self.lr_mode == 'Adam':
-            optimizer = optim.Adam(model.parameters(), lr=lr)
+            return optim.SGD(model.parameters(), lr=self.lr, momentum=self.momentum)
+        elif self.lr_mode == 'AdamW':
+            return optim.AdamW(model.parameters(), lr=self.lr, weight_decay=0)
         else:
-            raise NotImplementedError
-        # 客户端训练
-        if noise_mul > 0:
-            model, optimizer, train_loader = self.privacy_engine.make_private(
-                Vk=Vk,
-                module=model,
-                optimizer=optimizer,
-                data_loader=train_loader,
-                noise_multiplier=noise_mul,
-                max_grad_norm=clip,
-                poisson_sampling=False,
-            )
-        step = 0
-        while step < max_step:
-            for data, target in train_loader:
-                data = data.to(device)
-                target = target.to(device)
+            raise NotImplementedError(f"Unsupported optimizer: {self.lr_mode}")
+
+    def _freeze_feature_layer(self, model: nn.Module) -> None:
+        for param in model.parameters():
+            param.requires_grad = False
+
+        if hasattr(model, 'fc'):
+            for param in model.fc.parameters():
+                param.requires_grad = True
+        else:
+            raise AttributeError("Model does not have 'fc' attribute")
+
+    def _apply_privacy(self, model: nn.Module, optimizer: optim.Optimizer, vk: Optional[Any] = None):
+        model, optimizer, train_loader = self.privacy_engine.make_private(
+            Vk=vk,
+            module=model,
+            optimizer=optimizer,
+            data_loader=self.train_loader,
+            noise_multiplier=self.noise_mul,
+            max_grad_norm=self.clip,
+            poisson_sampling=False,
+        )
+        return model, optimizer, train_loader
+
+    def _save_model(self, model: nn.Module, r: int) -> None:
+        save_path = os.path.join(self.params_dir, f'round_{r}.pt')
+        torch.save(model.cpu().state_dict(), save_path)
+
+    def get_infinite_batches(self, data_loader):
+        """构建一个无限循环的数据生成器"""
+        while True:
+            for data, target in data_loader:
+                yield data, target
+
+    def train(self, model: nn.Module, r: int, vk: Optional[Any], **kwargs) -> None:
+        try:
+            model.train()
+            max_step = self.first_local_steps if r == 0 else self.local_steps
+
+            # 创建优化器
+            optimizer = self._create_optimizer(model)
+
+            # 第一轮冻结首层
+            if self.freeze_feature and r == 0:
+                self._freeze_feature_layer(model)
+
+            # 应用隐私保护
+            if self.noise_mul > 0:
+                model, optimizer, train_loader = self._apply_privacy(model, optimizer, vk)
+            else:
+                train_loader = self.train_loader
+
+            # 训练循环
+            batch_generator = iter(self.get_infinite_batches(train_loader))
+            for step in range(max_step):
+                data, target = next(batch_generator)
+
+                # data已在dataloader中处理
+                target = target.long().to(self.device)
+
                 optimizer.zero_grad()
                 output = model(data)
-                t_loss = criterion(output, target.long())
-                t_loss.backward()
-                optimizer.step()  # 优化器更新语句后模型梯度才会被更新
-                if optimizer.param_groups[0]['lr'] > 0.01:
-                    optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * self.lr_decay
-                    self.lr = optimizer.param_groups[0]['lr']
-                step += 1
-                if step >= max_step:
-                    break
-        # 计算模型总变化量
-        local_models_params = tensor_dict_to_vector(model.state_dict())
-        self.dW = local_models_params - vec_init
-        self.model_params = model.state_dict()
+                loss = self.criterion(output, target)
+                loss.backward()
+                optimizer.step()
+
+                # if (step+1) % 50 == 0:
+                #     pred = output.argmax(dim=1, keepdim=True)
+                #     accuracy = 100. * pred.eq(target.view_as(pred)).sum().item() / len(target)
+                #     print(f'client {self.id} training step {step+1} | Acc : {accuracy:.2f}%')
+
+            # 维护模型参数
+            self.model_params = {k: v.cpu() for k, v in model.state_dict().items()}
+
+        except Exception as e:
+            raise Exception(f"Training failed at round {r}: {str(e)}")
 
 
-class FedProxClient(object):
-    def __init__(self, id_num, train_d, val_d, device, train_config, mu=0.1):
-        self.id = id_num  # 客户端编号
-        self.train_loader = train_d
-        self.val_loader = val_d
-        self.data_size = len(self.train_loader.dataset)
-        self.device = device
-        self.lr_mode = train_config.get('lr_mode')
-        self.batch_size = train_config.get('batch_size')
-        self.local_steps = train_config.get('local_steps')
-        self.lr = train_config.get('lr')
-        self.lr_decay = train_config.get('lr_decay')
-
-        self.dW = None
-        self.model_params = None
-        self.criterion = nn.CrossEntropyLoss()
-
-        self.grad_clip = train_config.get('clip')
-        self.noise_multiplier = train_config.get('noise')
-        self.privacy_engine = PrivacyEngine(accountant='prv')
-
+class FedProxClient(BaseClient):
+    def __init__(self, id_num, train_d, train_config, mu):
+        super().__init__(id_num, train_d, train_config)
         self.mu = mu
 
-    def len(self):
-        return len(self.train_loader.dataset)
+    def train(self, model: nn.Module, r: int, vk: Optional[Any], **kwargs) -> None:
+        try:
+            model.train()
 
-    def evaluate(self, model):
-        device = self.device
-        criterion = self.criterion.to(device)
-        model.eval()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        val_loader = self.val_loader
-        with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels.long())
+            max_step = self.first_local_steps if r == 0 else self.local_steps
 
-                running_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
+            # 创建优化器
+            optimizer = self._create_optimizer(model)
 
-        val_loss = running_loss / len(val_loader)
-        val_acc = correct / total
-        return val_loss, val_acc
+            # 第一轮冻结特征层
+            if self.freeze_feature and r == 0:
+                self._freeze_feature_layer(model)
 
-    def train(self, model):
-        init_model = copy.deepcopy(model)
-        model.train()
-        vec_init = tensor_dict_to_vector(model.state_dict())
-        train_loader = self.train_loader
-        device = self.device
-        criterion = self.criterion.to(device)
-        noise_mul = self.noise_multiplier
-        clip = self.grad_clip
-        max_step = self.local_steps
-        lr = self.lr
-        if self.lr_mode == 'SGD':
-            optimizer = optim.SGD(model.parameters(), lr=lr)
-        elif self.lr_mode == 'Adam':
-            optimizer = optim.Adam(model.parameters(), lr=lr)
-        else:
-            raise NotImplementedError
-        # 客户端训练
-        if noise_mul > 0:
-            model, optimizer, train_loader = self.privacy_engine.make_private(
-                Vk=None,
-                module=model,
-                optimizer=optimizer,
-                data_loader=train_loader,
-                noise_multiplier=noise_mul,
-                max_grad_norm=clip,
-                poisson_sampling=False,
-            )
-        step = 0
-        while step < max_step:
-            for data, target in train_loader:
-                # print(step, optimizer.state_dict()['param_groups'][0]['lr'])
-                data = data.to(device)
-                target = target.to(device)
+            # 应用隐私保护
+            if self.noise_mul > 0:
+                model, optimizer, train_loader = self._apply_privacy(model, optimizer, vk)
+            else:
+                train_loader = self.train_loader
+
+            init_model = copy.deepcopy(model)
+
+            # 训练循环
+            batch_generator = iter(self.get_infinite_batches(train_loader))
+            for step in range(max_step):
+                # 每次无脑抽取下一个批次的数据，如果跑完一轮 dataloader，生成器会自动无缝重头开始
+                data, target = next(batch_generator)
+
+                # data已在dataloader中处理
+                target = target.long().to(self.device)
+
                 optimizer.zero_grad()
                 output = model(data)
-                t_loss = criterion(output, target.long())
+                loss = self.criterion(output, target)
 
                 # 添加近端项
                 proximal_term = 0.0
-                for param, global_param in zip(
-                    model.parameters(), init_model.parameters()
-                ):
-                    proximal_term += (param - global_param).norm(2)
-                t_loss += (self.mu / 2) * proximal_term
-
-                t_loss.backward()
-                optimizer.step()  # 优化器更新语句后模型梯度才会被更新
-                if optimizer.param_groups[0]['lr'] > 0.01:
-                    optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * self.lr_decay
-                    self.lr = optimizer.param_groups[0]['lr']
-                step += 1
-                if step >= max_step:
-                    break
-        # 计算模型总变化量
-        local_models_params = tensor_dict_to_vector(model.state_dict())
-        self.dW = local_models_params - vec_init
-        self.model_params = model.state_dict()
-
-
-class ScaffoldClient(object):
-    def __init__(self, id_num, train_d, val_d, device, train_config, model):
-        self.id = id_num  # 客户端编号
-        self.train_loader = train_d
-        self.val_loader = val_d
-        self.data_size = len(self.train_loader.dataset)
-        self.device = device
-        self.lr_mode = train_config.get('lr_mode')
-        self.batch_size = train_config.get('batch_size')
-        self.local_steps = train_config.get('local_steps')
-        self.lr = train_config.get('lr')
-        self.lr_decay = train_config.get('lr_decay')
-
-        self.dW = None
-        self.model_params = None
-        self.criterion = nn.CrossEntropyLoss()
-
-        self.grad_clip = train_config.get('clip')
-        self.noise_multiplier = train_config.get('noise')
-        self.privacy_engine = PrivacyEngine(accountant='prv')
-
-        self.client_control = {name: torch.zeros_like(param) for name, param in model.named_parameters()}
-        self.delta_control = {name: torch.zeros_like(param) for name, param in model.named_parameters()}
-
-    def len(self):
-        return len(self.train_loader.dataset)
-
-    def evaluate(self, model):
-        device = self.device
-        criterion = self.criterion.to(device)
-        model.eval()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        val_loader = self.val_loader
-        with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels.long())
-
-                running_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-
-        val_loss = running_loss / len(val_loader)
-        val_acc = correct / total
-        return val_loss, val_acc
-
-    def train(self, model, server_control):
-        model.train()
-        vec_init = tensor_dict_to_vector(model.state_dict())
-        train_loader = self.train_loader
-        device = self.device
-        criterion = self.criterion.to(device)
-        noise_mul = self.noise_multiplier
-        clip = self.grad_clip
-        max_step = self.local_steps
-        lr = self.lr
-        if self.lr_mode == 'SGD':
-            optimizer = optim.SGD(model.parameters(), lr=lr)
-        elif self.lr_mode == 'Adam':
-            optimizer = optim.Adam(model.parameters(), lr=lr)
-        else:
-            raise NotImplementedError
-        # 客户端训练
-        if noise_mul > 0:
-            model, optimizer, train_loader = self.privacy_engine.make_private(
-                Vk=None,
-                module=model,
-                optimizer=optimizer,
-                data_loader=train_loader,
-                noise_multiplier=noise_mul,
-                max_grad_norm=clip,
-                poisson_sampling=False,
-            )
-        step = 0
-        while step < max_step:
-            for data, target in train_loader:
-                # print(step, optimizer.state_dict()['param_groups'][0]['lr'])
-                data = data.to(device)
-                target = target.to(device)
-                optimizer.zero_grad()
-                output = model(data)
-                t_loss = criterion(output, target.long())
-                t_loss.backward()
-
-                # 计算修正后的梯度
+                init_params_dict = dict(init_model.named_parameters())
                 for name, param in model.named_parameters():
-                    if self.noise_multiplier > 0:
-                        name =  name.split('_module.')[-1]
-                    if param.grad is not None:
-                        param.grad += (server_control[name] - self.client_control[name])
+                    if param.requires_grad:
+                        if name in init_params_dict:
+                            init_param = init_params_dict[name]
+                            proximal_term += (param - init_param.to(param.device)).norm(2) ** 2
 
-                optimizer.step()  # 优化器更新语句后模型梯度才会被更新
-                if optimizer.param_groups[0]['lr'] > 0.01:
-                    optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * self.lr_decay
-                    self.lr = optimizer.param_groups[0]['lr']
-                step += 1
-                if step >= max_step:
-                    break
-        # 计算模型总变化量
-        local_models_params = tensor_dict_to_vector(model.state_dict())
-        self.dW = local_models_params - vec_init
-        self.model_params = model.state_dict()
+                loss += (self.mu / 2) * proximal_term
+                # print(f'noise_mul: {self.noise_mul}, mu: {self.mu}, proximal_term: {proximal_term:.4f}, CEloss: {loss - (self.mu / 2) * proximal_term:.4f}')
 
-        # Update local control variate
-        for name, param in model.named_parameters():
-            if self.noise_multiplier > 0:
-                name = name.split('_module.')[-1]
-            self.delta_control[name] = self.client_control[name] - server_control[name] - (param.grad / max_step)
-            self.client_control[name] = server_control[name] + self.delta_control[name]
+                loss.backward()
+                optimizer.step()
+
+                # if (step+1) % 50 == 0:
+                #     pred = output.argmax(dim=1, keepdim=True)
+                #     accuracy = 100. * pred.eq(target.view_as(pred)).sum().item() / len(target)
+                #     print(f'client {self.id} training step {step+1} | Acc : {accuracy:.2f}%')
+
+            # 维护模型参数
+            self.model_params = {k: v.cpu() for k, v in model.state_dict().items()}
+
+        except Exception as e:
+            raise Exception(f"Training failed at round {r}: {str(e)}")
 
 
-class FlexCflClient(object):
-    def __init__(self, id_num, train_d, val_d, device, train_config):
-        self.id = id_num  # 客户端编号
-        self.train_loader = train_d
-        self.val_loader = val_d
-        self.data_size = len(self.train_loader.dataset)
-        self.device = device
-        self.lr_mode = train_config.get('lr_mode')
-        self.batch_size = train_config.get('batch_size')
-        self.local_steps = train_config.get('local_steps')
-        self.lr = train_config.get('lr')
-        self.lr_decay = train_config.get('lr_decay')
+class ScaffoldClient(BaseClient):
+    def __init__(self, id_num, train_d, train_config, model):
+        super().__init__(id_num, train_d, train_config)
+        self.param_names = [name.replace('_module.', '') for name, _ in model.named_parameters()]
 
-        self.dW = None
-        self.model_params = None
-        self.criterion = nn.CrossEntropyLoss()
+        # 初始化控制变量（直接使用预处理后的名称）
+        self.client_control = {
+            clean_name: torch.zeros_like(param)
+            for clean_name, (_, param) in zip(self.param_names, model.named_parameters())
+        }
+        self.delta_control = {
+            name: torch.zeros_like(param)
+            for name, param in self.client_control.items()
+        }
 
-        self.grad_clip = train_config.get('clip')
-        self.noise_multiplier = train_config.get('noise')
-        self.privacy_engine = PrivacyEngine(accountant='prv')
+    def _update_control_vars(self, initial_weights, final_weights, server_control, max_step):
+        """更新控制变量（核心Scaffold算法）"""
+        for name in self.param_names:
+            dy = final_weights[name] - initial_weights[name]
+            c_server_val = server_control[name]
+            c_client_val = self.client_control[name]
 
-    def len(self):
-        return len(self.train_loader.dataset)
+            # 计算新控制变量: c_i_tilde = c_i_old - c_server - (Delta y)/(K*lr)
+            c_i_tilde = c_client_val - c_server_val - (dy / (max_step * self.lr))
 
-    def evaluate(self, model):
-        device = self.device
-        criterion = self.criterion.to(device)
-        model.eval()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        val_loader = self.val_loader
-        with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels.long())
+            # 更新差值和当前控制变量
+            self.delta_control[name] = c_i_tilde - c_client_val
+            self.client_control[name] = c_i_tilde
 
-                running_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
+    def train(self, model, r, vk, **kwargs):
+        server_control: Dict = kwargs.get('server_control', {})
 
-        val_loss = running_loss / len(val_loader)
-        val_acc = correct / total
-        return val_loss, val_acc
+        try:
+            model.train()
 
-    def train(self, model):
-        model.train()
-        vec_init = tensor_dict_to_vector(model.state_dict())
-        train_loader = self.train_loader
-        device = self.device
-        criterion = self.criterion.to(device)
-        noise_mul = self.noise_multiplier
-        clip = self.grad_clip
-        max_step = self.local_steps
-        lr = self.lr
-        if self.lr_mode == 'SGD':
-            optimizer = optim.SGD(model.parameters(), lr=lr)
-        elif self.lr_mode == 'Adam':
-            optimizer = optim.Adam(model.parameters(), lr=lr)
-        else:
-            raise NotImplementedError
-        # 客户端训练
-        if noise_mul > 0:
-            model, optimizer, train_loader = self.privacy_engine.make_private(
-                Vk=None,
-                module=model,
-                optimizer=optimizer,
-                data_loader=train_loader,
-                noise_multiplier=noise_mul,
-                max_grad_norm=clip,
-                poisson_sampling=False,
-            )
-        step = 0
-        while step < max_step:
-            for data, target in train_loader:
-                data = data.to(device)
-                target = target.to(device)
-                optimizer.zero_grad()
-                output = model(data)
-                t_loss = criterion(output, target.long())
-                t_loss.backward()
-                optimizer.step()  # 优化器更新语句后模型梯度才会被更新
-                if optimizer.param_groups[0]['lr'] > 0.01:
-                    optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * self.lr_decay
-                    self.lr = optimizer.param_groups[0]['lr']
-                step += 1
-                if step >= max_step:
-                    break
-        # 计算模型总变化量
-        local_models_params = tensor_dict_to_vector(model.state_dict())
-        self.dW = local_models_params - vec_init
-        self.model_params = model.state_dict()
+            initial_weights = {name: param.detach().clone() for name, param in model.named_parameters()}
 
+            max_step = self.first_local_steps if r == 0 else self.local_steps
 
-class FeSemClient(object):
-    def __init__(self, id_num, train_d, val_d, device, train_config):
-        self.id = id_num  # 客户端编号
-        self.train_loader = train_d
-        self.val_loader = val_d
-        self.data_size = len(self.train_loader.dataset)
-        self.device = device
-        self.lr_mode = train_config.get('lr_mode')
-        self.batch_size = train_config.get('batch_size')
-        self.local_steps = train_config.get('local_steps')
-        self.lr = train_config.get('lr')
-        self.lr_decay = train_config.get('lr_decay')
+            # 创建优化器
+            optimizer = self._create_optimizer(model)
 
-        self.dW = None
-        self.model_params = None
-        self.criterion = nn.CrossEntropyLoss()
+            # 第一轮冻结特征层
+            if self.freeze_feature and r == 0:
+                self._freeze_feature_layer(model)
 
-        self.grad_clip = train_config.get('clip')
-        self.noise_multiplier = train_config.get('noise')
-        self.privacy_engine = PrivacyEngine(accountant='prv')
-
-    def len(self):
-        return len(self.train_loader.dataset)
-
-    def evaluate(self, model):
-        device = self.device
-        criterion = self.criterion.to(device)
-        model.eval()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        val_loader = self.val_loader
-        with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs, labels = inputs.to(device), labels.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels.long())
-
-                running_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-
-        val_loss = running_loss / len(val_loader)
-        val_acc = correct / total
-        return val_loss, val_acc
-
-    def train(self, model):
-        model.train()
-        vec_init = tensor_dict_to_vector(model.state_dict())
-        train_loader = self.train_loader
-        device = self.device
-        criterion = self.criterion.to(device)
-        max_step = self.local_steps
-        noise_mul = self.noise_multiplier
-        clip = self.grad_clip
-        lr = self.lr
-        if self.lr_mode == 'SGD':
-            optimizer = optim.SGD(model.parameters(), lr=lr)
-        elif self.lr_mode == 'Adam':
-            optimizer = optim.Adam(model.parameters(), lr=lr)
-        else:
-            raise NotImplementedError
-        # 客户端训练
-        if noise_mul > 0:
-            model, optimizer, train_loader = self.privacy_engine.make_private(
-                Vk=None,
-                module=model,
-                optimizer=optimizer,
-                data_loader=train_loader,
-                noise_multiplier=noise_mul,
-                max_grad_norm=clip,
-                poisson_sampling=False,
-            )
-        step = 0
-        while step < max_step:
-            for data, target in train_loader:
-                data = data.to(device)
-                target = target.to(device)
-                optimizer.zero_grad()
-                output = model(data)
-                t_loss = criterion(output, target.long())
-                t_loss.backward()
-                optimizer.step()  # 优化器更新语句后模型梯度才会被更新
-                if optimizer.param_groups[0]['lr'] > 0.01:
-                    optimizer.param_groups[0]['lr'] = optimizer.param_groups[0]['lr'] * self.lr_decay
-                    self.lr = optimizer.param_groups[0]['lr']
-                step += 1
-                if step >= max_step:
-                    break
-        # 计算模型总变化量
-        local_models_params = tensor_dict_to_vector(model.state_dict())
-        self.dW = local_models_params - vec_init
-        self.model_params = model.state_dict()
-
-from typing import List, Tuple, Dict, Iterable, Optional
-import torch.nn.functional as F
-
-class FedRCClientLite(object):
-    """
-    子进程内使用的精简客户端，避免pickle主进程的复杂对象。
-    仅依赖：train_loader / val_loader / device / train_config
-    """
-    def __init__(self, train_loader, val_loader, device, train_config):
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.device = device
-        self.local_steps = train_config.get('local_steps')
-        self.lr = train_config.get('lr')
-        self.lr_decay = train_config.get('lr_decay')
-        self.grad_clip = train_config.get('clip')
-        self.noise_multiplier = train_config.get('noise')
-        self.privacy_engine = PrivacyEngine(accountant='prv')
-        self.criterion = nn.CrossEntropyLoss()
-
-    def len(self):
-        return len(self.train_loader.dataset)
-
-    @torch.no_grad()
-    def estimate_gamma_omega_for_client(self, models: List[nn.Module], num_classes: int = 10, max_val_batches: int = 10):
-        device = self.device
-        K = len(models)
-        omega = torch.full((K,), 1.0 / K, device=device)
-        C_yk = torch.ones(K, num_classes, device=device)
-        gamma_sums = torch.zeros(K, device=device)
-        sample_count = 0
-
-        gammas_batches: List[torch.Tensor] = []
-        batches = 0
-        for batch in self.val_loader:
-            x, y = batch[0].to(device), batch[1].to(device)
-            B = x.size(0)
-            logits_list = [models[k](x) for k in range(K)]
-            losses_per_k = [F.cross_entropy(logits_list[k], y, reduction='none') for k in range(K)]
-            losses = torch.stack(losses_per_k, dim=1)  # [B,K]
-            exp_neg_loss = torch.exp(-losses)
-            C_per_sample = torch.stack([C_yk[:, y[b]] for b in range(B)], dim=0)
-            q = omega.view(1, K) * exp_neg_loss / C_per_sample
-            gamma = q / (q.sum(dim=1, keepdim=True) + 1e-12)
-            gammas_batches.append(gamma.detach())
-            for b in range(B):
-                C_yk[:, y[b]] += gamma[b]
-            gamma_sums += gamma.sum(dim=0)
-            sample_count += B
-            batches += 1
-            if max_val_batches is not None and batches >= max_val_batches:
-                break
-
-        if sample_count > 0:
-            omega = gamma_sums / sample_count
-            omega = omega / (omega.sum() + 1e-12)
-
-        return gammas_batches, omega
-
-    def state_dict_sub(self, a: Dict[str, torch.Tensor], b: Dict[str, torch.Tensor]) -> Dict[
-        str, torch.Tensor]:
-        res = {}
-        for k in a.keys():
-            if self.noise_multiplier > 0:
-                group_k = k.split('_module.')[-1]
+            # 应用隐私保护
+            if self.noise_mul > 0:
+                model, optimizer, train_loader = self._apply_privacy(model, optimizer, vk)
             else:
-                group_k = k
-            res[group_k] = a[k] - b[group_k]
-        return res
+                train_loader = self.train_loader
 
-    def local_weighted_update(self, global_models: List[nn.Module], gammas_batches: List[torch.Tensor]) -> List[Dict[str, torch.Tensor]]:
-        train_loader = self.train_loader
-        device = self.device
-        local_epochs = self.local_steps
-        lr = self.lr
-        momentum = 0.9
-        weight_decay = 0
-        grad_clip = self.grad_clip
-        noise_multiplier = self.noise_multiplier
-        privacy_engine = self.privacy_engine
+            # 训练循环
+            batch_generator = iter(self.get_infinite_batches(train_loader))
+            for step in range(max_step):
+                # 每次无脑抽取下一个批次的数据，如果跑完一轮 dataloader，生成器会自动无缝重头开始
+                data, target = next(batch_generator)
 
-        K = len(global_models)
-        local_models = [copy.deepcopy(global_models[k]).to(device).train() for k in range(K)]
-        optimizers = [
-            torch.optim.SGD(local_models[k].parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
-            for k in range(K)
-        ]
+                # data已在dataloader中处理
+                target = target.long().to(self.device)
 
-        # 仅包装一次
-        if noise_multiplier > 0:
-            for k in range(K):
-                local_models[k], optimizers[k], train_loader = privacy_engine.make_private(
-                    Vk=None,
-                    module=local_models[k],
-                    optimizer=optimizers[k],
-                    data_loader=train_loader,
-                    noise_multiplier=noise_multiplier,
-                    max_grad_norm=grad_clip,
-                    poisson_sampling=False,
-                )
-        batch_idx = 0
-        while batch_idx < self.local_steps:
-            for batch in train_loader:
-                x, y = batch[0].to(device), batch[1].to(device)
-                gamma = gammas_batches[min(batch_idx, len(gammas_batches)-1)].to(device)
+                optimizer.zero_grad()
+                output = model(data)
+                loss = self.criterion(output, target)
+                loss.backward()
+                optimizer.step()
+
+                with torch.no_grad():
+                    for name, param in model.named_parameters():
+                        # 处理 Opacus 自动添加的 '_module.' 前缀
+                        clean_name = name.replace('_module.', '')
+
+                        c_server_val = server_control[clean_name].to(self.device)
+                        c_client_val = self.client_control[clean_name].to(self.device)
+
+                        # 直接修正参数权重
+                        param.data.add_(self.lr * (c_client_val - c_server_val))
+
+                # if (step+1) % 10 == 0:
+                #     pred = output.argmax(dim=1, keepdim=True)
+                #     accuracy = 100. * pred.eq(target.view_as(pred)).sum().item() / len(target)
+                #     print(f'client {self.id} training step {step+1} | Acc : {accuracy:.2f}%')
+
+            final_weights = {
+                name: param.detach().clone()
+                for name, param in zip(self.param_names, model.parameters())
+            }
+
+            self._update_control_vars(initial_weights, final_weights, server_control, max_step)
+
+            # 维护模型参数
+            self.model_params = {k: v.cpu() for k, v in model.state_dict().items()}
+
+        except Exception as e:
+            raise Exception(f"Training failed at round {r}: {str(e)}")
+
+
+class FlexCflClient(BaseClient):
+    def __init__(self, id_num, train_d, train_config):
+        super().__init__(id_num, train_d, train_config)
+
+
+class FeSemClient(BaseClient):
+    def __init__(self, id_num, train_d, train_config):
+        super().__init__(id_num, train_d, train_config)
+
+
+class FedRCClient(BaseClient):
+    def __init__(self, id_num, train_d, train_config, K):
+        super().__init__(id_num, train_d, train_config)
+        # FedRC 特有的温度参数，用于控制软聚类的平滑程度 (对应论文中的 lambda)
+        self.temperature = 1.0
+        self.num_clusters = K
+        self.pi_weights = None
+
+    def train(self, model: List[nn.Module], r: int, vk: Optional[Any], **kwargs) -> None:
+        """
+        FedRC 客户端训练逻辑
+        :param global_state_dicts: 包含 K 个聚类中心模型 state_dict 的列表
+        :return: (K个更新后的 state_dict 列表, 客户端对这K个模型的分配权重 pi)
+        """
+        K = len(model)
+        models = [copy.deepcopy(m).to(self.device) for m in model]
+        for m in models:
+            m.eval()
+
+        # 2. 计算 FedRC 软分配权重 (Soft Assignments, \pi)
+        losses = torch.zeros(K).to(self.device)
+        with torch.no_grad():
+            for x, y in self.train_loader:
+                y = y.to(self.device)
                 for k in range(K):
-                    optimizers[k].zero_grad(set_to_none=True)
-                    logits = local_models[k](x)
-                    ce = F.cross_entropy(logits, y, reduction='none')
-                    weights = gamma[:, k]
-                    denom = weights.sum() + 1e-12
-                    loss = torch.sum(weights * ce) / denom
-                    loss.backward()
-                    optimizers[k].step()
-                    if optimizers[k].param_groups[0]['lr'] > 0.01:
-                        optimizers[k].param_groups[0]['lr'] = optimizers[k].param_groups[0]['lr'] * self.lr_decay
-                self.lr =optimizers[0].param_groups[0]['lr']
-                batch_idx += 1
-                if batch_idx >= self.local_steps:
-                    break
+                    out = models[k](x)
+                    loss = self.criterion(out, y)
+                    losses[k] += loss.item()
 
-        deltas = []
+        # 对损失取负并除以温度参数，再用 Softmax 转换为概率权重
+        losses = losses / len(self.train_loader)
+        pi_weights = F.softmax(-losses / self.temperature, dim=0)
+
+        # 3. 本地执行 K 个模型的更新 (M-step 近似)
+        updated_state_dicts = []
         for k in range(K):
-            new_sd = local_models[k].state_dict()
-            old_sd = global_models[k].state_dict()
-            # 参数名一致
-            delta = self.state_dict_sub(new_sd, old_sd)
-            # delta = {kk: (new_sd[kk] - old_sd[kk]).detach().cpu() for kk in new_sd.keys()}
-            deltas.append(delta)
-        return deltas
+            try:
+                model = models[k]
+                model.train()
+                max_step = self.first_local_steps if r == 0 else self.local_steps
+
+                # 创建优化器
+                optimizer = self._create_optimizer(model)
+
+                # 第一轮冻结首层
+                if self.freeze_feature and r == 0:
+                    self._freeze_feature_layer(model)
+
+                # 应用隐私保护
+                if self.noise_mul > 0:
+                    model, optimizer, train_loader = self._apply_privacy(model, optimizer, vk)
+                else:
+                    train_loader = self.train_loader
+
+                # 训练循环
+                batch_generator = iter(self.get_infinite_batches(train_loader))
+                for step in range(max_step):
+                    data, target = next(batch_generator)
+
+                    # data已在dataloader中处理
+                    target = target.long().to(self.device)
+
+                    optimizer.zero_grad()
+                    output = model(data)
+                    loss = self.criterion(output, target)
+                    loss.backward()
+                    optimizer.step()
+
+                    # if (step+1) % 50 == 0:
+                    #     pred = output.argmax(dim=1, keepdim=True)
+                    #     accuracy = 100. * pred.eq(target.view_as(pred)).sum().item() / len(target)
+                    #     print(f'client {self.id} training step {step+1} | Acc : {accuracy:.2f}%')
+
+                # 维护模型参数
+                updated_state_dicts.append({k.replace('_module.', ''): v.cpu() for k, v in model.state_dict().items()})
+
+            except Exception as e:
+                raise Exception(f"Training failed at round {r}: {str(e)}")
+
+        self.model_params = updated_state_dicts
+        self.pi_weights = pi_weights.cpu().numpy()
+
+
+class DeCflClient(BaseClient):
+    """
+    DeCFL 客户端（子类），继承自 FedAvgClient
+    包含数据增强多样性、DistilBERT 优化器分组及 Py-aware 训练逻辑
+    """
+
+    def __init__(self, id_num, train_d, train_config):
+        super().__init__(id_num, train_d, train_config)
+
+    def train(self, model: nn.Module, r: int, vk: Optional[Any], **kwargs):
+        try:
+            model.train()
+            max_step = self.first_local_steps if r == 0 else self.local_steps
+
+            # 创建优化器
+            optimizer = self._create_optimizer(model)
+
+            # 第一轮冻结特征层
+            if self.freeze_feature and r == 0:
+                self._freeze_feature_layer(model)
+
+            # 应用隐私保护
+            if self.noise_mul > 0:
+                model, optimizer, train_loader = self._apply_privacy(model, optimizer, vk)
+            else:
+                train_loader = self.train_loader
+
+            # 训练循环
+            bias_grad = []
+            batch_generator = iter(self.get_infinite_batches(train_loader))
+            for step in range(max_step):
+                data, target = next(batch_generator)
+
+                # data已在dataloader中处理
+                target = target.long().to(self.device)
+
+                optimizer.zero_grad()
+                output = model(data)
+                loss = self.criterion(output, target)
+                loss.backward()
+                optimizer.step()
+
+                if r == 0:
+                    for k, v in model.named_parameters():
+                        if (self.noise_mul > 0 and k == '_module.fc.bias') or (k == 'fc.bias'):
+                            bias_grad.append(v.grad.clone().detach().cpu().clone())
+
+                # if (step+1) % 10 == 0:
+                #     pred = output.argmax(dim=1, keepdim=True)
+                #     accuracy = 100. * pred.eq(target.view_as(pred)).sum().item() / len(target)
+                #     print(f'client {self.id} training step {step+1} | Acc : {accuracy:.2f}%')
+
+            # 维护模型参数
+            self.model_params = model.cpu().state_dict()
+
+            if r == 0:
+                st = 20
+                ed = min(st + 30, max_step)
+                data = torch.stack(bias_grad).numpy()
+                bias_grad_std = np.std(data[st: ed], axis=0)
+                pre_py = bias_grad_std / np.sum(bias_grad_std)
+
+                true_py = np.bincount(self.train_loader.dataset.labels, minlength=len(pre_py))
+                true_py = true_py / np.sum(true_py)
+                py_dis = jensenshannon(true_py, pre_py)
+
+                return pre_py, py_dis
+
+        except Exception as e:
+            raise Exception(f"Training failed at round {r}: {str(e)}")
