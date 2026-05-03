@@ -434,67 +434,62 @@ class DPOptimizer(Optimizer):
         Performs gradient clipping.
         Stores clipped and aggregated gradients into `p.summed_grad```
         """
-        if self.Vk is None:
-            if len(self.grad_samples[0]) == 0:
-                # Empty batch
-                per_sample_clip_factor = torch.zeros(
-                    (0,), device=self.grad_samples[0].device
-                )
-            else:
-                per_param_norms = [
-                    g.reshape(len(g), -1).norm(2, dim=-1) for g in self.grad_samples
-                ]
-                per_sample_norms = torch.stack(per_param_norms, dim=1).norm(2, dim=1)
-                per_sample_clip_factor = (
-                        self.max_grad_norm / (per_sample_norms + 1e-6)
-                ).clamp(max=1.0)
+        """
+        Performs gradient clipping.
+        Stores clipped and aggregated gradients into `p.summed_grad```
+        """
+        has_projection = self.Vk is not None
 
-            for p in self.params:
-                _check_processed_flag(p.grad_sample)
-                grad_sample = self._get_flat_grad_sample(p)
-                grad = torch.einsum("i,i...", per_sample_clip_factor, grad_sample)
+        per_sample_clip_factor = None
+        processed_grad_samples = []
 
-                if p.summed_grad is not None:
-                    p.summed_grad += grad
-                else:
-                    p.summed_grad = grad
+        # 第一阶段：计算梯度、投影（可选）、平均（可选）
 
-                _mark_as_processed(p.grad_sample)
+        if len(self.grad_samples[0]) == 0:
+            per_sample_clip_factor = torch.zeros((0,), device=self.grad_samples[0].device)
+            processed_grad_samples = []
+
         else:
-            if len(self.grad_samples[0]) == 0:
-                per_sample_clip_factor = torch.zeros((0,), device=self.grad_samples[0].device)
+            # 1. 展平所有梯度以便处理
+            grads_flat = [g.reshape(len(g), -1) for g in self.grad_samples]
+            all_grads = torch.cat(grads_flat, dim=1)
+
+            # 2. 投影步骤 (如果 Vk 存在)
+            if has_projection:
+                final_grads = torch.matmul(torch.matmul(all_grads, self.Vk), self.Vk.T)
             else:
-                # 执行投影计算
-                grads = [g.reshape(len(g), -1) for g in self.grad_samples]
-                flattened_grads = torch.concatenate(grads, dim=1)  # 沿列方向拼接
-                proj_grads = torch.matmul(torch.matmul(flattened_grads, self.Vk), self.Vk.T)
-                start_idx = 0
-                proj_grad_samples = []
-                for grad in self.grad_samples:
-                    end_idx = start_idx + grad.reshape(len(grad), -1).shape[1]
-                    proj_grad_samples.append(proj_grads[:, start_idx:end_idx].reshape_as(grad))
-                    start_idx = end_idx
-                # 基于投影梯度计算裁剪尺度
-                per_param_norms = [
-                    g.reshape(len(g), -1).norm(2, dim=-1) for g in proj_grad_samples
-                ]
-                per_sample_norms = torch.stack(per_param_norms, dim=1).norm(2, dim=1)
-                # per_sample_norms2 = torch.stack(
-                #     [g.reshape(len(g), -1).norm(2, dim=-1) for g in self.grad_samples], dim=1).norm(2, dim=1)
-                per_sample_clip_factor = (
-                        self.max_grad_norm / (per_sample_norms + 1e-6)
-                ).clamp(max=1.0)
+                final_grads = all_grads
 
-            for p, grad_sample in zip(self.params, proj_grad_samples):
-                _check_processed_flag(p.grad_sample)
-                grad = torch.einsum("i,i...", per_sample_clip_factor, grad_sample)
+            # 3. 计算裁剪因子
+            per_sample_norms = torch.norm(final_grads, dim=1)
+            per_sample_clip_factor = (self.max_grad_norm / (per_sample_norms + 1e-6)).clamp(max=1.0)
 
-                if p.summed_grad is not None:
-                    p.summed_grad += grad
-                else:
-                    p.summed_grad = grad
+            # 4. 切分回各个参数的形状
+            start_idx = 0
+            for grad in self.grad_samples:
+                param_flat_dim = grad.reshape(len(grad), -1).shape[1]
+                end_idx = start_idx + param_flat_dim
 
-                _mark_as_processed(grad_sample)
+                split_grad = final_grads[:, start_idx:end_idx].view(-1, *grad.shape[1:])
+                processed_grad_samples.append(split_grad)
+
+                start_idx = end_idx
+
+        # 第二阶段：统一应用裁剪并累加
+        if per_sample_clip_factor is None:
+            per_sample_clip_factor = torch.zeros((0,), device=self.grad_samples[0].device)
+
+        for p, grad_sample in zip(self.params, processed_grad_samples):
+            _check_processed_flag(p.grad_sample)
+
+            grad = torch.einsum("i,i...", per_sample_clip_factor, grad_sample)
+
+            if p.summed_grad is not None:
+                p.summed_grad += grad
+            else:
+                p.summed_grad = grad
+
+            _mark_as_processed(p.grad_sample)
 
     def add_noise(self):
         """
@@ -503,15 +498,14 @@ class DPOptimizer(Optimizer):
         if self.Vk is None:
             for p in self.params:
                 _check_processed_flag(p.summed_grad)
-                # 原始梯度获取
-                original_grad = p.summed_grad
+
                 noise = _generate_noise(
                     std=self.noise_multiplier * self.max_grad_norm,
-                    reference=original_grad,
+                    reference=p.summed_grad,
                     generator=self.generator,
                     secure_mode=self.secure_mode,
                 )
-                p.grad = (original_grad + noise).view_as(p)
+                p.grad = (p.summed_grad + noise).view_as(p)
 
                 _mark_as_processed(p.summed_grad)
         else:

@@ -42,12 +42,13 @@ class AdaClipDPOptimizer(DPOptimizer):
         self,
         optimizer: Optimizer,
         *,
+        Vk,
         noise_multiplier: float,
-        target_unclipped_quantile: float,
-        clipbound_learning_rate: float,
-        max_clipbound: float,
-        min_clipbound: float,
-        unclipped_num_std: float,
+        target_unclipped_quantile: float = 0.5,
+        clipbound_learning_rate: float = 0.2,
+        max_clipbound: float = 3,
+        min_clipbound: float = 0.1,
+        unclipped_num_std: float = 1.0,
         max_grad_norm: float,
         expected_batch_size: Optional[int],
         loss_reduction: str = "mean",
@@ -57,6 +58,7 @@ class AdaClipDPOptimizer(DPOptimizer):
     ):
         super().__init__(
             optimizer,
+            Vk=Vk,
             noise_multiplier=noise_multiplier,
             max_grad_norm=max_grad_norm,
             expected_batch_size=expected_batch_size,
@@ -89,24 +91,64 @@ class AdaClipDPOptimizer(DPOptimizer):
         self.unclipped_num = 0
 
     def clip_and_accumulate(self):
-        per_param_norms = [
-            g.view(len(g), -1).norm(2, dim=-1) for g in self.grad_samples
-        ]
-        per_sample_norms = torch.stack(per_param_norms, dim=1).norm(2, dim=1)
-        per_sample_clip_factor = (self.max_grad_norm / (per_sample_norms + 1e-6)).clamp(
-            max=1.0
-        )
+        B = self.expected_batch_size
+        K = len(self.grad_samples[0]) // B if B > 0 else 0
 
-        # the two lines below are the only changes
-        # relative to the parent DPOptimizer class.
-        self.sample_size += len(per_sample_clip_factor)
-        self.unclipped_num += (
-            len(per_sample_clip_factor) - (per_sample_clip_factor < 1).sum()
-        )
+        has_projection = self.Vk is not None
+        needs_averaging = K > 1
 
-        for p in self.params:
+        per_sample_clip_factor = None
+        processed_grad_samples = []
+
+        # 第一阶段：计算梯度、投影（可选）、平均（可选）
+
+        if len(self.grad_samples[0]) == 0:
+            per_sample_clip_factor = torch.zeros((0,), device=self.grad_samples[0].device)
+            processed_grad_samples = []
+
+        else:
+            # 1. 展平所有梯度以便处理
+            grads_flat = [g.reshape(len(g), -1) for g in self.grad_samples]
+            all_grads = torch.cat(grads_flat, dim=1)
+
+            current_batch_size = len(all_grads)  # 实际是 B * K
+
+            # 2. 投影步骤 (如果 Vk 存在)
+            if has_projection:
+                processed_all = torch.matmul(torch.matmul(all_grads, self.Vk), self.Vk.T)
+            else:
+                processed_all = all_grads
+
+            # 3. 平均步骤 (如果 K > 1)
+            if needs_averaging:
+                reshaped_grads = processed_all.view(B, K, *processed_all.shape[1:])
+                # final_grads = reshaped_grads.mean(dim=1)
+                final_grads = reshaped_grads.sum(dim=1)
+            else:
+                final_grads = processed_all
+
+            # 4. 计算裁剪因子
+            per_sample_norms = torch.norm(final_grads, dim=1)
+            per_sample_clip_factor = (self.max_grad_norm / (per_sample_norms + 1e-6)).clamp(max=1.0)
+
+            # 5. 切分回各个参数的形状
+            start_idx = 0
+            for grad in self.grad_samples:
+                param_flat_dim = grad.reshape(len(grad), -1).shape[1]
+                end_idx = start_idx + param_flat_dim
+
+                split_grad = final_grads[:, start_idx:end_idx].view(-1, *grad.shape[1:])
+                processed_grad_samples.append(split_grad)
+
+                start_idx = end_idx
+
+        # 第二阶段：统一应用裁剪并累加
+        if per_sample_clip_factor is None:
+            per_sample_clip_factor = torch.zeros((0,), device=self.grad_samples[0].device)
+
+        for p, grad_sample in zip(self.params, processed_grad_samples):
             _check_processed_flag(p.grad_sample)
-            grad_sample = self._get_flat_grad_sample(p)
+
             grad = torch.einsum("i,i...", per_sample_clip_factor, grad_sample)
 
             if p.summed_grad is not None:
@@ -115,6 +157,11 @@ class AdaClipDPOptimizer(DPOptimizer):
                 p.summed_grad = grad
 
             _mark_as_processed(p.grad_sample)
+
+        # 自适应裁剪
+        self.unclipped_num += (
+            len(per_sample_clip_factor) - (per_sample_clip_factor < 1).sum()
+        )
 
     def add_noise(self):
         super().add_noise()
